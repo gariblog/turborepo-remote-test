@@ -1,0 +1,6 @@
+node_modules/
+.turbo/
+apps/web/dist/
+apps/web/build-ran.txt
+apps/web/verify-ran.txt
+marker
