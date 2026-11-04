@@ -1,0 +1,105 @@
+name: Turborepo PR cache restore test
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  controlled-restore:
+    if: github.repository == 'gariblog/turborepo-remote-test'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TURBO_TELEMETRY_DISABLED: '1'
+      CI: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --disable-pip-version-check zstandard
+          npm ci --no-audit --no-fund
+      - name: Verify fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .turbo/cache/fb1b45c4be1a6a59-meta.json
+          test -f .turbo/cache/fb1b45c4be1a6a59.tar.zst
+          test "$(node_modules/.bin/turbo --version)" = "2.11.10"
+          mkdir -p evidence
+          echo "repository=$GITHUB_REPOSITORY" | tee evidence/preflight.txt
+          echo "sha=$GITHUB_SHA" | tee -a evidence/preflight.txt
+          git ls-files --error-unmatch .turbo/cache/fb1b45c4be1a6a59.tar.zst
+      - name: Install controlled test hook
+        run: |
+          git config user.name "Disposable CI Test"
+          git config user.email "ci-poc@example.invalid"
+          mkdir -p .git/hooks
+          printf '#!/bin/sh\necho CONTROLLED_HOOK_BASELINE\n' > .git/hooks/pre-commit
+          chmod +x .git/hooks/pre-commit
+          test -x .git/hooks/pre-commit
+      - name: Run Turbo restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          node_modules/.bin/turbo run verify --filter=web 2>&1 | tee evidence/turbo.log
+      - name: Assert restore and record hook behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib, subprocess
+          root=pathlib.Path(".")
+          evidence=root/"evidence"
+          h="fb1b45c4be1a6a59"
+          manifest=root/".turbo"/"cache"/f"{h}-manifest.json"
+          hook=root/".git"/"hooks"/"pre-commit"
+          build_ran=(root/"apps/web/build-ran.txt").exists()
+          verify_ran=(root/"apps/web/verify-ran.txt").exists()
+          is_link=manifest.is_symlink()
+          target=os.readlink(manifest) if is_link else None
+          hook_text=hook.read_text(errors="replace") if hook.exists() else ""
+          executable=bool(hook.exists() and (hook.stat().st_mode & 0o111))
+          report={
+            "task_hash":h,
+            "build_script_skipped_cache_hit":not build_ran,
+            "dependent_verify_task_ran":verify_ran,
+            "manifest_sidecar_is_symlink":is_link,
+            "manifest_symlink_target":target,
+            "hook_overwritten_with_manifest_json":hook_text.lstrip().startswith("{"),
+            "hook_executable_after_restore":executable
+          }
+          assert not build_ran, "Build script ran; expected cache restore"
+          assert verify_ran, "Dependent verify task did not run"
+          assert is_link, "Manifest sidecar is not a symlink"
+          assert target=="../../.git/hooks/pre-commit", f"Unexpected symlink target: {target}"
+          assert hook_text.lstrip().startswith("{"), "Hook content not overwritten with manifest JSON"
+          assert executable, "Overwritten hook lost executable bit"
+          p=subprocess.run(["git","-c","core.hooksPath=.git/hooks","commit","--allow-empty","-m","trigger controlled test hook"],capture_output=True,text=True)
+          report["git_commit_exit_code"]=p.returncode
+          report["hook_invocation_failed_as_expected"]=p.returncode != 0
+          report["commit_stdout"]=p.stdout[-2000:]
+          report["commit_stderr"]=p.stderr[-2000:]
+          (evidence/"summary.json").write_text(json.dumps(report,indent=2)+"\n")
+          print(json.dumps(report,indent=2))
+          assert report["hook_invocation_failed_as_expected"], "Commit unexpectedly succeeded"
+          PY
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-test-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 7
