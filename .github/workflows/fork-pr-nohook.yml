@@ -55,7 +55,7 @@ jobs:
           h="d6d64d99a8c9e2ae"
           meta=json.loads(pathlib.Path(f".turbo/cache/{h}-meta.json").read_text())
           assert meta["hash"]==h
-          pathlib.Path("evidence/task-hash.txt").write_text(h+"\\n")
+          pathlib.Path("evidence/task-hash.txt").write_text(h)
           print("FORK_COMMITTED_ARTIFACT_HASH_MATCH:",h)
           PY
           sha256sum ".turbo/cache/$committed_hash.tar.zst" | tee evidence/archive.sha256
@@ -94,7 +94,7 @@ jobs:
           report["git_commit_exit_code"]=p.returncode
           report["git_commit_succeeded"]=p.returncode==0
           report["commit_stderr"]=p.stderr[-1500:]
-          pathlib.Path("evidence/nohook-summary.json").write_text(json.dumps(report,indent=2)+"\\n")
+          pathlib.Path("evidence/nohook-summary.json").write_text(json.dumps(report,indent=2))
           print(json.dumps(report,indent=2))
           assert report["git_commit_succeeded"], "Commit should ignore a non-executable hook"
           PY
