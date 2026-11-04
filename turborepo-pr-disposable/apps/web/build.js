@@ -1,0 +1,1 @@
+const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('build-ran.txt','BUILD_SCRIPT_EXECUTED\n'); fs.writeFileSync('dist/index.html','normal build output\n'); console.log('BUILD_SCRIPT_EXECUTED');
