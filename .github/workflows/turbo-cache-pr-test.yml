@@ -30,17 +30,6 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check zstandard
           npm ci --no-audit --no-fund
-      - name: Verify fixture
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f .turbo/cache/fb1b45c4be1a6a59-meta.json
-          test -f .turbo/cache/fb1b45c4be1a6a59.tar.zst
-          test "$(node_modules/.bin/turbo --version)" = "2.11.10"
-          mkdir -p evidence
-          echo "repository=$GITHUB_REPOSITORY" | tee evidence/preflight.txt
-          echo "sha=$GITHUB_SHA" | tee -a evidence/preflight.txt
-          git ls-files --error-unmatch .turbo/cache/fb1b45c4be1a6a59.tar.zst
       - name: Install controlled test hook
         run: |
           git config user.name "Disposable CI Test"
@@ -49,6 +38,42 @@ jobs:
           printf '#!/bin/sh\necho CONTROLLED_HOOK_BASELINE\n' > .git/hooks/pre-commit
           chmod +x .git/hooks/pre-commit
           test -x .git/hooks/pre-commit
+      - name: Prepare cache artifact for this exact checkout hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          node_modules/.bin/turbo run verify --filter=web --dry=json > evidence/dry-run.json
+          python - <<'PY'
+          import io, json, pathlib, tarfile
+          import zstandard
+          dry=json.loads(pathlib.Path("evidence/dry-run.json").read_text())
+          task=next(t for t in dry["tasks"] if t["taskId"]=="web#build")
+          h=task["hash"]
+          cache=pathlib.Path(".turbo/cache")
+          cache.mkdir(parents=True,exist_ok=True)
+          raw=io.BytesIO()
+          with tarfile.open(fileobj=raw,mode="w") as tf:
+              link=tarfile.TarInfo(f".turbo/cache/{h}-manifest.json.tmp")
+              link.type=tarfile.SYMTYPE
+              link.linkname="../../.git/hooks/pre-commit"
+              link.mode=0o777
+              link.mtime=0
+              tf.addfile(link)
+              payload=b"controlled cache-hit output\n"
+              item=tarfile.TarInfo("apps/web/dist/cache-hit.txt")
+              item.size=len(payload)
+              item.mode=0o644
+              item.mtime=0
+              tf.addfile(item,io.BytesIO(payload))
+          compressed=zstandard.ZstdCompressor().compress(raw.getvalue())
+          (cache/f"{h}.tar.zst").write_bytes(compressed)
+          (cache/f"{h}-meta.json").write_text(json.dumps({
+              "hash":h,"duration":1,"sha":None,"dirty_hash":None
+          })+"\n")
+          pathlib.Path("evidence/task-hash.txt").write_text(h+"\n")
+          print("Prepared cache archive for task hash:",h)
+          PY
       - name: Run Turbo restore
         shell: bash
         run: |
@@ -62,7 +87,7 @@ jobs:
           import json, os, pathlib, subprocess
           root=pathlib.Path(".")
           evidence=root/"evidence"
-          h="fb1b45c4be1a6a59"
+          h=(evidence/"task-hash.txt").read_text().strip()
           manifest=root/".turbo"/"cache"/f"{h}-manifest.json"
           hook=root/".git"/"hooks"/"pre-commit"
           build_ran=(root/"apps/web/build-ran.txt").exists()
@@ -71,9 +96,11 @@ jobs:
           target=os.readlink(manifest) if is_link else None
           hook_text=hook.read_text(errors="replace") if hook.exists() else ""
           executable=bool(hook.exists() and (hook.stat().st_mode & 0o111))
+          cache_output=(root/"apps/web/dist/cache-hit.txt").exists()
           report={
             "task_hash":h,
             "build_script_skipped_cache_hit":not build_ran,
+            "cache_output_restored":cache_output,
             "dependent_verify_task_ran":verify_ran,
             "manifest_sidecar_is_symlink":is_link,
             "manifest_symlink_target":target,
@@ -81,6 +108,7 @@ jobs:
             "hook_executable_after_restore":executable
           }
           assert not build_ran, "Build script ran; expected cache restore"
+          assert cache_output, "Expected cache output was not restored"
           assert verify_ran, "Dependent verify task did not run"
           assert is_link, "Manifest sidecar is not a symlink"
           assert target=="../../.git/hooks/pre-commit", f"Unexpected symlink target: {target}"
