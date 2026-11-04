@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  controlled-restore:
+  committed-artifact-restore:
     if: github.repository == 'gariblog/turborepo-remote-test'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -38,42 +38,30 @@ jobs:
           printf '#!/bin/sh\necho CONTROLLED_HOOK_BASELINE\n' > .git/hooks/pre-commit
           chmod +x .git/hooks/pre-commit
           test -x .git/hooks/pre-commit
-      - name: Prepare cache artifact for this exact checkout hash
+      - name: Restore pre-committed cache archive
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p evidence
+          mkdir -p evidence .turbo/cache
           node_modules/.bin/turbo run verify --filter=web --dry=json > evidence/dry-run.json
+          expected_hash="$(python -c 'import json; d=json.load(open("evidence/dry-run.json")); print(next(t["hash"] for t in d["tasks"] if t["taskId"]=="web#build"))')"
+          committed_hash="d6d64d99a8c9e2ae"
+          test "$expected_hash" = "$committed_hash" || {
+            echo "Committed artifact hash mismatch: expected $expected_hash, committed $committed_hash"
+            exit 1
+          }
+          test -f ".turbo/cache/$committed_hash.tar.zst.b64"
+          test -f ".turbo/cache/$committed_hash-meta.json"
+          base64 --decode ".turbo/cache/$committed_hash.tar.zst.b64" > ".turbo/cache/$committed_hash.tar.zst"
           python - <<'PY'
-          import io, json, pathlib, tarfile
-          import zstandard
-          dry=json.loads(pathlib.Path("evidence/dry-run.json").read_text())
-          task=next(t for t in dry["tasks"] if t["taskId"]=="web#build")
-          h=task["hash"]
-          cache=pathlib.Path(".turbo/cache")
-          cache.mkdir(parents=True,exist_ok=True)
-          raw=io.BytesIO()
-          with tarfile.open(fileobj=raw,mode="w") as tf:
-              link=tarfile.TarInfo(f".turbo/cache/{h}-manifest.json.tmp")
-              link.type=tarfile.SYMTYPE
-              link.linkname="../../.git/hooks/pre-commit"
-              link.mode=0o777
-              link.mtime=0
-              tf.addfile(link)
-              payload=b"controlled cache-hit output\n"
-              item=tarfile.TarInfo("apps/web/dist/cache-hit.txt")
-              item.size=len(payload)
-              item.mode=0o644
-              item.mtime=0
-              tf.addfile(item,io.BytesIO(payload))
-          compressed=zstandard.ZstdCompressor().compress(raw.getvalue())
-          (cache/f"{h}.tar.zst").write_bytes(compressed)
-          (cache/f"{h}-meta.json").write_text(json.dumps({
-              "hash":h,"duration":1,"sha":None,"dirty_hash":None
-          })+"\n")
+          import json, pathlib
+          h="d6d64d99a8c9e2ae"
+          meta=json.loads(pathlib.Path(f".turbo/cache/{h}-meta.json").read_text())
+          assert meta["hash"]==h, meta
           pathlib.Path("evidence/task-hash.txt").write_text(h+"\n")
-          print("Prepared cache archive for task hash:",h)
+          print("Using cache archive committed before this workflow run:",h)
           PY
+          sha256sum ".turbo/cache/$committed_hash.tar.zst" | tee evidence/committed-archive.sha256
       - name: Run Turbo restore
         shell: bash
         run: |
@@ -99,6 +87,7 @@ jobs:
           cache_output=(root/"apps/web/dist/cache-hit.txt").exists()
           report={
             "task_hash":h,
+            "archive_was_committed_before_workflow":True,
             "build_script_skipped_cache_hit":not build_ran,
             "cache_output_restored":cache_output,
             "dependent_verify_task_ran":verify_ran,
